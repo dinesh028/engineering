@@ -1,0 +1,110 @@
+create external table abc.kudu_test_hive_table1 (id string, name string) PARTITIONED BY (par string) STORED AS ORC LOCATION '/user/abc/xyz/abc/data/abc/processing/kudu_test_hive_table1' TBLPROPERTIES ('orc.bloom.filter.columns'='id');
+
+create external table abc.kudu_test_hive_table3 (id string, name string) PARTITIONED BY (par string) STORED AS Parquet LOCATION '/user/abc/xyz/abc/data/abc/processing/kudu_test_hive_table3' ;
+
+create external table abc.kudu_test_hive_table2 (id string, name string) PARTITIONED BY (par string) STORED AS ORC LOCATION '/user/abc/xyz/abc/data/abc/processing/kudu_test_hive_table2' TBLPROPERTIES ('orc.bloom.filter.columns'='id');
+
+
+create table kudu_test_kudu_table1 (id string PRIMARY KEY, name string) PARTITION BY HASH(id) PARTITIONS 18  STORED AS KUDU TBLPROPERTIES ('kudu.num_tablet_replicas' = '1');   
+
+create table kudu_test_kudu_table2 (id string PRIMARY KEY, name string) PARTITION BY HASH(id) PARTITIONS 18  STORED AS KUDU TBLPROPERTIES ('kudu.num_tablet_replicas' = '1');   
+
+spark-shell --packages org.apache.kudu:kudu-spark2_2.11:1.10.0 --master yarn --queue abc --num-executors 5
+
+
+====
+import org.apache.kudu.client._
+import org.apache.kudu.spark.kudu.KuduContext
+import collection.JavaConverters._
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.Row
+
+val r = 1 to 100000000
+val df = spark.sparkContext.parallelize(r).toDF
+df.registerTempTable("source")
+val hivedf= spark.sql("select cast(value as string) as id, 'jaiganesh' as name, cast ((value % 18) as string) as par from source")
+spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+
+val startTime=System.currentTimeMillis
+hivedf.write.mode("Overwrite").option("orc.bloom.filter.columns","id").insertInto("abc.kudu_test_hive_table1")
+val endTime=System.currentTimeMillis
+print(endTime-startTime) 
+--
+
+val startTime=System.currentTimeMillis
+hivedf.write.mode("Overwrite").insertInto("abc.kudu_test_hive_table3")
+val endTime=System.currentTimeMillis
+print(endTime-startTime) 
+
+--
+val kuduContext = new KuduContext("abc002.mymachine.wm.com:7051", spark.sparkContext)
+val kududf=hivedf.select("id", "name")
+val startTime=System.currentTimeMillis
+kuduContext.insertRows(kududf, "impala::abc.kudu_test_kudu_table1")
+val endTime=System.currentTimeMillis
+print(endTime-startTime) 
+
+---
+val selectdf = spark.read.options(Map("kudu.master" -> "abc002.mymachine.wm.com:7051", "kudu.table" -> "impala::abc.kudu_test_kudu_table1")).format("kudu").load
+
+val startTime=System.currentTimeMillis
+selectdf.where("id in ('8','8845','78554744','123','90001')").show
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+---
+val startTime=System.currentTimeMillis
+spark.sql("select * from abc.kudu_test_hive_table3 where id in ('8','8845','78554744','123','90001')").show
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+--
+val startTime=System.currentTimeMillis
+spark.sql("select * from abc.kudu_test_hive_table1 where id in ('8','8845','78554744','123','90001')").show
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+--
+val h1= spark.sql("select * from abc.kudu_test_hive_table1")
+val h2= spark.sql("select * from abc.kudu_test_hive_table3")
+val h3= h1.join(h2,"id").select(h1("id"),h1("name"),h1("par"))
+val startTime=System.currentTimeMillis
+h3.write.mode("Overwrite").option("orc.bloom.filter.columns","id").insertInto("abc.kudu_test_hive_table2")
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+---
+val h2= spark.sql("select * from abc.kudu_test_hive_table3 where id in ('8','1','2')")
+val h4= h1.join(h2,"name").select(h1("id"),h1("name"),h1("par"))
+val startTime=System.currentTimeMillis
+h4.write.mode("Overwrite").option("orc.bloom.filter.columns","id").insertInto("abc.kudu_test_hive_table2")
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+---
+val h5=h1.join(selectdf, "id").select(h1("id"),h1("name"),h1("par"))
+val startTime=System.currentTimeMillis
+h5.write.mode("Overwrite").option("orc.bloom.filter.columns","id").insertInto("abc.kudu_test_hive_table2")
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+----
+val h6 = selectdf.join(broadcast(h2),"name").select(selectdf("id"),selectdf("name"))
+h6.registerTempTable("joinTable")
+val h7=spark.sql("select id, name, cast (cast(id as int) % 18 as string) as par from joinTable")
+
+val startTime=System.currentTimeMillis
+h7.write.mode("Overwrite").option("orc.bloom.filter.columns","id").insertInto("abc.kudu_test_hive_table2")
+val endTime=System.currentTimeMillis
+print(endTime-startTime)
+===
+
+Impala - 
+select *, row_number() over(order by name) from kudu_test_kudu_table1 where cast(id as int)%18=0;
+select *,  concat(cast(cast(id as int)%18 as string), name) ds from kudu_test_kudu_table1 limit 10;
+select * from (select *, row_number() over (partition by ds order by id desc) rnk from (select *,  concat(cast(cast(id as int)%5000 as string), name) ds from kudu_test_kudu_table1) T ) T1 where rnk=1;
+select * from abc.kudu_test_hive_table3 a join kudu_test_kudu_table1 b on (a.id=b.id) limit 10;
+select * from kudu_test_kudu_table1 a join kudu_test_kudu_table1 b on (a.id=b.id) limit 10; // self join
+
+select max(rnk) from (select *, row_number() over (partition by ds order by id desc) rnk from (select *,  concat(cast(cast(id as int)%5000 as string), name) ds from kudu_test_kudu_table1) T ) T1 
+
+
+select * from kudu_test_hive_table3 a join kudu_test_hive_table3 b on (a.id=b.id) limit 10;
+select * from (select *, row_number() over (partition by ds order by id desc) rnk from (select *,  concat(cast(cast(id as int)%5000 as string), name) ds from kudu_test_hive_table3) T ) T1 where rnk=1;
+select max(rnk) from (select *, row_number() over (partition by ds order by id desc) rnk from (select *,  concat(cast(cast(id as int)%5000 as string), name) ds from kudu_test_hive_table3) T ) T1 
